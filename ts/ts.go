@@ -17,10 +17,12 @@
 		name string length=1000
 		comment string default zero
 	} {
-		{2, 0x00...00, "control.version"},
+		{1, 0x00...00, "control.version"},
 		{2, 0x00...00, "control.table"},
 		{3, 0x00...00, "control.fieldtype"},
-		{4, 0x00...00, "control.column"},
+		{4, 0x00...00, "control.tag"},
+		{5, 0x00...00, "control.column"},
+		{6, 0x00...00, "control.column/tag"},
 	}
 	let control/fieldtype table {
 		id int64 key
@@ -28,12 +30,12 @@
 		length_prefix bool
 		bit_size int64
 	} {
-		{0, "hash", false, 256},
-		{1, "int64", false, 64},
-		{2, "bool", false, 1},
-		{3, "string", true, 0},
-		{4, "bytes", true, 0},
-		{5, "any", true, 0},
+		{1, "hash", false, 256},
+		{2, "int64", false, 64},
+		{3, "bool", false, 1},
+		{4, "string", true, 0},
+		{5, "bytes", true, 0},
+		{6, "any", true, 0},
 	}
 	let control/tag table {
 		id int64 key
@@ -119,3 +121,152 @@ The data for the schemas are written first, followed by the data for all other t
 
 */
 package ts
+
+import (
+	"errors"
+	"fmt"
+	"io"
+)
+
+var ErrStreamCancel = errors.New("ts: stream cancel")
+
+const (
+	controlVersionID = 1
+	controlTableID   = 2
+	controlFieldType = 3
+	controlTag       = 4
+	controlColumn    = 5
+	controlColumnTag = 6
+)
+
+type Type int64
+
+const (
+	Hash   Type = 1
+	Int64  Type = 2
+	Bool   Type = 3
+	String Type = 4
+	Bytes  Type = 5
+	Any    Type = 6
+)
+
+type Encoder struct {
+	err error
+	w   io.Writer
+
+	rowID map[int64]int64
+}
+type Decoder struct {
+	table map[int64][]chunk
+}
+
+type chunk struct {
+	readOffset int64
+	values     map[int64]valueChunk
+	rowCount   int64
+}
+
+type valueChunk struct {
+	readOffset  int64 // Read offset from top of file.
+	valueID     int64
+	valueOffset int64
+	valueLength int64
+}
+
+func NewEncoder(w io.Writer) *Encoder {
+	e := &Encoder{
+		w:     w,
+		rowID: make(map[int64]int64, 10),
+	}
+	e.initControl()
+	return e
+}
+
+func (e *Encoder) initControl() {
+	ver := e.Table("control/version",
+		Col{Name: "version", Type: Hash},
+	)
+	e.Insert(ver, 0)
+	if ver.id != controlVersionID {
+		panic("control/version.id incorrect")
+	}
+	// TODO(kardianos): finish setting up remaining control tables.
+}
+
+type Table struct {
+	id      int64
+	all     []string // Names of all valid columns.
+	col     []string // Names of the columns to work with from table.
+	invalid []string // Invalid names.
+}
+
+func (t Table) Use(columns ...string) Table {
+	return Table{
+		id:  t.id,
+		all: t.all,
+		col: columns, // TODO(kardianos): ensure all columns are valid names.
+	}
+}
+
+type Col struct {
+	Name string
+	Type Type
+}
+
+type Row struct {
+	table int64
+	id    int64
+}
+
+var errTable = Table{id: -1}
+var errRow = Row{id: -1}
+
+func (e *Encoder) Table(name string, cols ...Col) Table {
+	if e.err != nil {
+		return errTable
+	}
+	// TODO(kardianos): encode column schema, store schema in Encoder.
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = c.Name
+	}
+	return Table{
+		id:  e.nextRowID(controlTableID),
+		all: names,
+		col: names,
+	}
+}
+
+func (e *Encoder) nextRowID(tid int64) int64 {
+	rid := e.rowID[tid]
+	rid++
+	e.rowID[tid] = rid
+	return rid
+}
+
+func (e *Encoder) Err() error {
+	return e.err
+}
+
+func (e *Encoder) Insert(t Table, values ...interface{}) Row {
+	if e.err != nil {
+		return errRow
+	}
+	if len(t.invalid) > 0 {
+		e.err = fmt.Errorf("st: invalid table names: %q", t.invalid)
+		return errRow
+	}
+	return Row{
+		table: e.nextRowID(t.id),
+	}
+}
+
+func NewDecoder(r io.ReadSeeker) *Decoder {
+	return nil
+}
+
+// indexTable reads through the entire data structure, seeking each
+// new token until the EOF is reached.
+func (d *Decoder) indexTable() error {
+	return nil
+}
