@@ -168,20 +168,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 )
 
 var ErrStreamCancel = errors.New("ts: stream cancel")
 
 const (
 	controlVersionID   = 1
-	controlTableID     = 2
-	controlFieldTypeID = 3
-	controlTagID       = 4
-	controlColumnID    = 5
-	controlColumnTagID = 6
+	controlTagID       = 2
+	controlTableID     = 3
+	controlTableTagID  = 4
+	controlFieldTypeID = 5
+	controlColumnID    = 6
+	controlColumnTagID = 7
 )
 
 type Type int64
+
+type zero struct{}
+
+var Zero = zero{}
 
 const (
 	Hash   Type = 1
@@ -192,8 +198,12 @@ const (
 	Any    Type = 6
 )
 
+type Tag int64
+
+type Tags []Tag
+
 const (
-	TagHidden int64 = 1
+	TagHidden Tag = 1
 )
 
 type Writer struct {
@@ -230,25 +240,51 @@ func NewWriter(w io.Writer) *Writer {
 	return e
 }
 
+func (w *Writer) tableIDList() []int64 {
+	tt := make([]int64, 0, len(w.table))
+	for tid := range w.table {
+		tt = append(tt, tid)
+	}
+	sort.Slice(tt, func(i, j int) bool {
+		return tt[i] < tt[j]
+	})
+	return tt
+}
+
 func (w *Writer) initControl() {
-	version := w.Table("control/version",
+	version := w.Define(Table{Name: "control/version"},
 		Col{Name: "version", Type: Hash},
 	)
 	if version.id != controlVersionID {
 		panic("control/version.id incorrect")
 	}
-	table := w.Table("control/table",
-		Col{Name: "id", Type: Int64},
-		Col{Name: "version", Type: Hash},
+	tag := w.Define(Table{Name: "control/tag"},
+		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "name", Type: String},
-		Col{Name: "comment", Type: String},
+	)
+	if tag.id != controlTagID {
+		panic("control/tag.id incorrect")
+	}
+	table := w.Define(Table{Name: "control/table"},
+		Col{Name: "id", Type: Int64, Key: true},
+		Col{Name: "version", Type: Hash, Default: Zero},
+		Col{Name: "name", Type: String},
+		Col{Name: "comment", Type: String, Default: Zero},
 	)
 	if table.id != controlTableID {
 		panic("control/table.id incorrect")
 	}
+	tableTag := w.Define(Table{Name: "control/table/tag"},
+		Col{Name: "id", Type: Int64, Key: true},
+		Col{Name: "table", Type: Int64},
+		Col{Name: "tag", Type: Int64},
+	)
+	if tableTag.id != controlTableTagID {
+		panic("control/table/tag.id incorrect")
+	}
 
-	fieldtype := w.Table("control/fieldtype",
-		Col{Name: "id", Type: Int64},
+	fieldtype := w.Define(Table{Name: "control/fieldtype"},
+		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "bit_size", Type: Int64},
 		Col{Name: "name", Type: String},
 	)
@@ -256,13 +292,6 @@ func (w *Writer) initControl() {
 		panic("control/fieldtype.id incorrect")
 	}
 
-	tag := w.Table("control/tag",
-		Col{Name: "id", Type: Int64},
-		Col{Name: "name", Type: String},
-	)
-	if tag.id != controlTagID {
-		panic("control/tag.id incorrect")
-	}
 	/*
 		let control/column table {
 			id int64 key
@@ -292,27 +321,27 @@ func (w *Writer) initControl() {
 			comment string default zero
 		}
 	*/
-	column := w.Table("control/column",
-		Col{Name: "id", Type: Int64},
-		Col{Name: "version", Type: Hash},
+	column := w.Define(Table{Name: "control/column"},
+		Col{Name: "id", Type: Int64, Key: true},
+		Col{Name: "version", Type: Hash, Default: Zero},
 		Col{Name: "table", Type: Int64},
 		Col{Name: "fieldtype", Type: Int64},
-		Col{Name: "link", Type: Int64},
-		Col{Name: "key", Type: Bool},
-		Col{Name: "nullable", Type: Bool},
-		Col{Name: "max_runes", Type: Int64},
-		Col{Name: "fixed_bit_size", Type: Int64},
-		Col{Name: "sort_order", Type: Int64},
+		Col{Name: "link", Type: Int64, Nullable: true},
+		Col{Name: "key", Type: Bool, Default: Zero},
+		Col{Name: "nullable", Type: Bool, Default: Zero},
+		Col{Name: "max_runes", Type: Int64, Default: Zero},
+		Col{Name: "fixed_bit_size", Type: Int64, Default: Zero, Tags: Tags{TagHidden}},
+		Col{Name: "sort_order", Type: Int64, Default: Zero},
 		Col{Name: "name", Type: String},
 		Col{Name: "default", Type: Any},
-		Col{Name: "comment", Type: String},
+		Col{Name: "comment", Type: String, Default: Zero},
 	)
 	if column.id != controlColumnID {
 		panic("control/column.id incorrect")
 	}
 
-	columnTag := w.Table("control/column/tag",
-		Col{Name: "id", Type: Int64},
+	columnTag := w.Define(Table{Name: "control/column/tag"},
+		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "column", Type: Int64},
 		Col{Name: "tag", Type: Int64},
 	)
@@ -338,18 +367,23 @@ func (w *Writer) initControl() {
 
 	w.Insert(tag, TagHidden, "hidden")
 
-	// TODO(kardianos): finish setting up remaining control tables.
+	// c2 := column.Use("table", "fieldtype", "key", "nullable", "name")
+	// w.Insert(c2, controlVersionID, Hash, false, false, "version")
+	// TODO(kardianos): Don't add data into column, table/tag, or column/tag directlly. Add from previous table definitions.
+	for _, tid := range w.tableIDList() {
+		cc := w.table[tid]
+	}
 }
 
-type Table struct {
+type TableRef struct {
 	id      int64
 	all     map[string]bool // Names of all valid columns.
 	col     []string        // Names of the columns to work with from table.
 	invalid []string        // Invalid names.
 }
 
-func (t Table) Use(columns ...string) Table {
-	ut := Table{
+func (t TableRef) Use(columns ...string) TableRef {
+	ut := TableRef{
 		id:  t.id,
 		all: t.all,
 		col: columns,
@@ -362,20 +396,36 @@ func (t Table) Use(columns ...string) Table {
 	return ut
 }
 
+type Table struct {
+	Name    string
+	Comment string
+	Tags    Tags
+}
+
 type Col struct {
 	Name string
 	Type Type
+
+	Link      int64 // column.id
+	Key       bool
+	Nullable  bool
+	MaxRunes  int64
+	SortOrder int64
+	Default   interface{}
+	Comment   string
+
+	Tags Tags
 }
 
-type Row struct {
+type RowRef struct {
 	table int64
 	id    int64
 }
 
-var errTable = Table{id: -1}
-var errRow = Row{id: -1}
+var errTable = TableRef{id: -1}
+var errRow = RowRef{id: -1}
 
-func (w *Writer) Table(name string, cols ...Col) Table {
+func (w *Writer) Define(t Table, cols ...Col) TableRef {
 	if w.err != nil {
 		return errTable
 	}
@@ -388,7 +438,7 @@ func (w *Writer) Table(name string, cols ...Col) Table {
 		lookup[c.Name] = true
 	}
 	w.table[tid] = cols
-	return Table{
+	return TableRef{
 		id:  tid,
 		all: lookup,
 		col: names,
@@ -410,7 +460,7 @@ func (w *Writer) Error() error {
 	return w.err
 }
 
-func (w *Writer) Insert(t Table, values ...interface{}) Row {
+func (w *Writer) Insert(t TableRef, values ...interface{}) RowRef {
 	if w.err != nil {
 		return errRow
 	}
@@ -418,7 +468,7 @@ func (w *Writer) Insert(t Table, values ...interface{}) Row {
 		w.err = fmt.Errorf("st: invalid table names: %q", t.invalid)
 		return errRow
 	}
-	return Row{
+	return RowRef{
 		table: w.nextRowID(t.id),
 	}
 }
