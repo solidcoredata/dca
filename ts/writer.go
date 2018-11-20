@@ -92,118 +92,71 @@ Field Lendth notes:
 
 The data for the schemas are written first, followed by the data for all other tables.
 
-0	00	00000000	NUL	null
-1	01	00000001	SOH	start of header
-2	02	00000010	STX	start of text
-3	03	00000011	ETX	end of text
-4	04	00000100	EOT	end of transmission
-5	05	00000101	ENQ	enquiry
-6	06	00000110	ACK	acknowledge
-7	07	00000111	BEL	bell
-8	08	00001000	BS	backspace
-9	09	00001001	HT	horizontal tab
-10	0A	00001010	LF	line feed
-11	0B	00001011	VT	vertical tab
-12	0C	00001100	FF	form feed
-13	0D	00001101	CR	enter / carriage return
-14	0E	00001110	SO	shift out
-15	0F	00001111	SI	shift in
-16	10	00010000	DLE	data link escape
-17	11	00010001	DC1	device control 1
-18	12	00010010	DC2	device control 2
-19	13	00010011	DC3	device control 3
-20	14	00010100	DC4	device control 4
-21	15	00010101	NAK	negative acknowledge
-22	16	00010110	SYN	synchronize
-23	17	00010111	ETB	end of trans. block
-24	18	00011000	CAN	cancel
-25	19	00011001	EM	end of medium
-26	1A	00011010	SUB	substitute
-27	1B	00011011	 ESC	escape
-28	1C	00011100	 FS	file separator
-29	1D	00011101	GS	group separator
-30	1E	00011110	RS	record separator
-31	1F	00011111	US	unit separator
-127	7F	01111111	DEL	delete
+	SOH = 1 : Start of Header
+	STX = 2 : Start of Text
+	EOT = 4 : End of Transmission
+	SO = 14 : Shift out
+	DLE = 16 : Data Link Escape
+	CAN = 24 : Cancel
+	DC1 = 17 : Device Control 1
+	DC2 = 18 : Device Control 2
+	DC3 = 19 : Device Control 3
+	DC4 = 20 : Device Control 4
+	SUB = 26 : Substitute
+	FS = 28 : File Sep
+	GS = 29 : Group Sep
+	RS = 30 : Row Sep
+	US = 31 : Unit Sep
 
-VERSION = SOH "SCD01" STX
-CANCEL = DLE CAN
-ROW = DLE RS
-CHUNK_TABLE = DLE DC1
-CHUNK_VALUE = DLE DC2
-CHUNK_SUM = DLE DC3
-EOF = DLE EOT
+	---
 
-	VERSION=[]byte("DC00")
-	CHUNK_TABLE=[]byte("CT")<table-id><chunk-size-bytes><table-data>
-	CHUNK_VALUE=[]byte("CV")<value-id><value-offset-bytes><value-size-bytes><value-data>
-	CHUNK_SUM=[]byte("ST")<hash-sum-of-preceding-chunk>
-	ROW=[]byte("RM")<value-mask><row-data>
-	CANCEL=[]byte{255, 255}
-	EOF=[]byte{0, 0}
+	VERSION = SOH "SCD01" NULL STX
+	PADDING = FS SO <chunk-length> (begin-chunk) NUL * CHUNK_LENGTH (end-chunk)
+
+	The chunk header contains an index of all rows within it.
+	Each Row has a specific type prior to the offset list.
+	These types may include:
+	 * Data Row
+	 * Field Value
+	 * Delta (insert/update/delete)
+	 * Validation
+	 * ? Error code + Error message ?
+	 * Reference Data Row
+
+	CHUNK = FS DC1 <chunk-length> (begin-chunk) <table-id><row-count><row-offset-list><row-data> (end-chunk)
+		<row-offset-list> = [N]<row-type><row-offset-from-chunk-start>[/N]
+
+		ROW = DLE RS <row-data>
+			variable length field = <value-size-bytes><value-id><value-data>
+		VALUE = FS DC2 <chunk-length> (begin-chunk) <value-id><value-offset-bytes><value-data> (end-chunk)
+
+	CANCEL = DLE CAN
+	EOF = DLE EOT
 
 	{VERSION}
 	[for each schema data table, including control tables]
 		[N chunks]
-			{CHUNK_TABLE}
+			{CHUNK}
 			[M rows]
 				{ROW}
 			[/M rows]
-			{CHUNK_SUM}
 			[K values]
-				{CHUNK_VALUE}
-				{CHUNK_SUM}
+				{VALUE}
 			[/K values]
+			{/Chunk}
 		[/N chunks]
 	[/for each schema data table]
 	[optional]
 		{CANCEL}
 	[/optional]
 	{EOF}
-
 */
 package ts
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"sort"
-)
-
-var ErrStreamCancel = errors.New("ts: stream cancel")
-
-const (
-	controlVersionID   = 1
-	controlTagID       = 2
-	controlTableID     = 3
-	controlTableTagID  = 4
-	controlFieldTypeID = 5
-	controlColumnID    = 6
-	controlColumnTagID = 7
-)
-
-type Type int64
-
-type zero struct{}
-
-var Zero = zero{}
-
-const (
-	Hash   Type = 1
-	Int64  Type = 2
-	Bool   Type = 3
-	String Type = 4
-	Bytes  Type = 5
-	Any    Type = 6
-)
-
-type Tag int64
-
-type Tags []Tag
-
-const (
-	TagHidden Tag = 1
 )
 
 type Writer struct {
@@ -212,11 +165,9 @@ type Writer struct {
 
 	table map[int64][]Col
 	rowID map[int64]int64
-}
-type Reader struct {
-	table map[int64][]chunk
-}
 
+	schemaWritten map[int64]bool
+}
 type chunk struct {
 	readOffset int64
 	values     map[int64]valueChunk
@@ -232,9 +183,10 @@ type valueChunk struct {
 
 func NewWriter(w io.Writer) *Writer {
 	e := &Writer{
-		w:     w,
-		rowID: make(map[int64]int64, 10),
-		table: make(map[int64][]Col, 10),
+		w:             w,
+		rowID:         make(map[int64]int64, 10),
+		table:         make(map[int64][]Col, 10),
+		schemaWritten: make(map[int64]bool, 10),
 	}
 	e.initControl()
 	return e
@@ -292,48 +244,19 @@ func (w *Writer) initControl() {
 		panic("control/fieldtype.id incorrect")
 	}
 
-	/*
-		let control/column table {
-			id int64 key
-			version hash
-			table *control.table
-			fieldtype *control.fieldtype
-			link *control.table nullable
-			name string
-			key bool default zero
-			nullable bool default zero
-
-			// Maximum number of runes to encode into field.
-			// Max byte storage could be 4x this number.
-			max_runes int64
-
-			// This is written by the encoder and read by the decoder.
-			// This is not set by the user.
-			// For variable length fields, the encoder decides how much to write into
-			// the row. For fixed length fields, this is still populated. That way a decoder that
-			// will always have the correct length and can generally read with a mmap.
-			fixed_bit_size int64 :hidden
-
-			 // The preferred order this column should appear, relative to other columns
-			// in the same table.
-			sort_order int
-			default any
-			comment string default zero
-		}
-	*/
 	column := w.Define(Table{Name: "control/column"},
 		Col{Name: "id", Type: Int64, Key: true},
-		Col{Name: "version", Type: Hash, Default: Zero},
+		Col{Name: "version", Type: Hash, Default: Zero, Tags: Tags{TagHidden}},
 		Col{Name: "table", Type: Int64},
 		Col{Name: "fieldtype", Type: Int64},
 		Col{Name: "link", Type: Int64, Nullable: true},
 		Col{Name: "key", Type: Bool, Default: Zero},
 		Col{Name: "nullable", Type: Bool, Default: Zero},
-		Col{Name: "max_runes", Type: Int64, Default: Zero},
+		Col{Name: "length", Type: Int64, Default: Zero, Comment: "For strings this is the number of allowed runes. For bytes it is the byte count."},
 		Col{Name: "fixed_bit_size", Type: Int64, Default: Zero, Tags: Tags{TagHidden}},
 		Col{Name: "sort_order", Type: Int64, Default: Zero},
 		Col{Name: "name", Type: String},
-		Col{Name: "default", Type: Any},
+		Col{Name: "default", Type: Any, Nullable: true},
 		Col{Name: "comment", Type: String, Default: Zero},
 	)
 	if column.id != controlColumnID {
@@ -349,30 +272,10 @@ func (w *Writer) initControl() {
 		panic("control/column/tag.id incorrect")
 	}
 
+	w.Flush()
+
+	// TODO(kardianos): Calculate hash of control/*.
 	w.Insert(version, 0)
-
-	w.Insert(table, controlVersionID, 0, "control/version", "")
-	w.Insert(table, controlTableID, 0, "control/table", "")
-	w.Insert(table, controlFieldTypeID, 0, "control/fieldtype", "")
-	w.Insert(table, controlTagID, 0, "control/tag", "")
-	w.Insert(table, controlColumnID, 0, "control/column", "")
-	w.Insert(table, controlColumnTagID, 0, "control/column/Tag", "")
-
-	w.Insert(fieldtype, Hash, 256, "hash")
-	w.Insert(fieldtype, Int64, 64, "int64")
-	w.Insert(fieldtype, Bool, 1, "bool")
-	w.Insert(fieldtype, String, 0, "string")
-	w.Insert(fieldtype, Bytes, 0, "bytes")
-	w.Insert(fieldtype, Any, 0, "any")
-
-	w.Insert(tag, TagHidden, "hidden")
-
-	// c2 := column.Use("table", "fieldtype", "key", "nullable", "name")
-	// w.Insert(c2, controlVersionID, Hash, false, false, "version")
-	// TODO(kardianos): Don't add data into column, table/tag, or column/tag directlly. Add from previous table definitions.
-	for _, tid := range w.tableIDList() {
-		cc := w.table[tid]
-	}
 }
 
 type TableRef struct {
@@ -446,7 +349,53 @@ func (w *Writer) Define(t Table, cols ...Col) TableRef {
 }
 
 func (w *Writer) Flush() {
+	if w.err != nil {
+		return
+	}
 
+	// TODO(kardianos): Don't add data into column, table/tag, or column/tag directlly. Add from previous table definitions.
+	// Gather all un-written schema changes and write them first.
+	encodeTID := make([]int64, 0)
+	for _, tid := range w.tableIDList() {
+		if !w.schemaWritten[tid] {
+			continue
+		}
+		encodeTID = append(encodeTID, tid)
+		w.schemaWritten[tid] = true
+
+	}
+	for _, tid := range encodeTID {
+		// TODO(kardianos): write table block.
+	}
+	for _, tid := range encodeTID {
+		cc := w.table[tid]
+		for i, c := range cc {
+			// TODO(kardianos): write column block.
+		}
+	}
+
+	// Then write any un-written data changes.
+
+	/*
+		w.Insert(table, controlVersionID, 0, "control/version", "")
+		w.Insert(table, controlTableID, 0, "control/table", "")
+		w.Insert(table, controlFieldTypeID, 0, "control/fieldtype", "")
+		w.Insert(table, controlTagID, 0, "control/tag", "")
+		w.Insert(table, controlColumnID, 0, "control/column", "")
+		w.Insert(table, controlColumnTagID, 0, "control/column/Tag", "")
+
+		w.Insert(fieldtype, Hash, 256, "hash")
+		w.Insert(fieldtype, Int64, 64, "int64")
+		w.Insert(fieldtype, Bool, 1, "bool")
+		w.Insert(fieldtype, String, 0, "string")
+		w.Insert(fieldtype, Bytes, 0, "bytes")
+		w.Insert(fieldtype, Any, 0, "any")
+
+		w.Insert(tag, TagHidden, "hidden")
+
+		// c2 := column.Use("table", "fieldtype", "key", "nullable", "name")
+		// w.Insert(c2, controlVersionID, Hash, false, false, "version")
+	*/
 }
 
 func (w *Writer) nextRowID(tid int64) int64 {
@@ -471,14 +420,4 @@ func (w *Writer) Insert(t TableRef, values ...interface{}) RowRef {
 	return RowRef{
 		table: w.nextRowID(t.id),
 	}
-}
-
-func NewReader(r io.Reader) *Reader {
-	return nil
-}
-
-// indexTable reads through the entire data structure, seeking each
-// new token until the EOF is reached.
-func (r *Reader) indexTable() error {
-	return nil
 }

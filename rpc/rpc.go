@@ -16,3 +16,11 @@ type AliveRequest struct {
 }
 type AliveResponse struct {
 }
+
+type TSMsg struct {
+	Version      string // = 1 // Only sent in first message.
+	FirstMessage bool   // = 2
+	LastMessage  bool   // = 3
+	Cancel       bool   // = 4
+	Chunk        []byte // = 10
+}
