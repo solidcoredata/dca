@@ -123,15 +123,15 @@ The data for the schemas are written first, followed by the data for all other t
 	 * ? Error code + Error message ?
 	 * Reference Data Row
 
-	CHUNK = FS DC1 <chunk-length> (begin-chunk) <table-id><row-count><row-offset-list><row-data> (end-chunk)
+	CHUNK = FS "C" <chunk-length> (begin-chunk) <table-id><row-count><row-offset-list><row-data> (end-chunk)
 		<row-offset-list> = [N]<row-type><row-offset-from-chunk-start>[/N]
 
-		ROW = DLE RS <row-data>
+		ROW = RS "R" <row-data>
 			variable length field = <value-size-bytes><value-id><value-data>
-		VALUE = FS DC2 <chunk-length> (begin-chunk) <value-id><value-offset-bytes><value-data> (end-chunk)
+		VALUE = RS "F" <value-id><value-offset-bytes><value-data>
 
-	CANCEL = DLE CAN
-	EOF = DLE EOT
+	CANCEL = FS CAN
+	EOF = FS EOT
 
 	{VERSION}
 	[for each schema data table, including control tables]
@@ -154,19 +154,36 @@ The data for the schemas are written first, followed by the data for all other t
 package ts
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"sort"
+)
+
+var (
+	fileHeader       = []byte{1, 'S', 'C', 'D', '0', '1', 0, 2} // SOH "SCD01" NUL STX
+	fileCancel       = []byte{28, 24}                           // FS CAN
+	fileEOF          = []byte{28, 4}                            // FS EOT
+	markerChunk      = []byte{asciiFS, 'C'}                     // FS "C"
+	markerRow        = []byte{asciiRS, 'R'}                     // RS "R"
+	markerFieldValue = []byte{asciiRS, 'F'}                     // RS "F"
 )
 
 type Writer struct {
 	err error
 	w   io.Writer
 
-	table map[int64][]Col
-	rowID map[int64]int64
+	chunksWritten int64
+	chunkBuffer   *bytes.Buffer
 
-	schemaWritten map[int64]bool
+	table   map[int64][]Col
+	rowID   map[int64]int64
+	control map[int64]TableRef
+
+	// rowBuffer is written to by the Insert call, then written to disk
+	// and emptied on Flush.
+	rowBuffer map[int64][][]byte // map[tableID][]RowData
 }
 type chunk struct {
 	readOffset int64
@@ -183,10 +200,11 @@ type valueChunk struct {
 
 func NewWriter(w io.Writer) *Writer {
 	e := &Writer{
-		w:             w,
-		rowID:         make(map[int64]int64, 10),
-		table:         make(map[int64][]Col, 10),
-		schemaWritten: make(map[int64]bool, 10),
+		w:           w,
+		chunkBuffer: &bytes.Buffer{},
+		rowID:       make(map[int64]int64, 10),
+		table:       make(map[int64][]Col, 10),
+		control:     make(map[int64]TableRef, 10),
 	}
 	e.initControl()
 	return e
@@ -203,48 +221,56 @@ func (w *Writer) tableIDList() []int64 {
 	return tt
 }
 
+func (w *Writer) rowBufferTID() []int64 {
+	tt := make([]int64, 0, len(w.rowBuffer))
+	for tid := range w.rowBuffer {
+		tt = append(tt, tid)
+	}
+	sort.Slice(tt, func(i, j int) bool {
+		return tt[i] < tt[j]
+	})
+	return tt
+}
+
+func (w *Writer) csetup(tid int64, t Table, c ...Col) TableRef {
+	tref := w.Define(t, c...)
+	if tref.id != tid {
+		panic(fmt.Errorf("%s.id incorrect: wanted %d, got %d", t.Name, tid, tref.id))
+	}
+	w.control[tid] = tref
+	return tref
+}
+
 func (w *Writer) initControl() {
-	version := w.Define(Table{Name: "control/version"},
+	version := w.csetup(controlVersionID, Table{Name: "control/version"},
 		Col{Name: "version", Type: Hash},
 	)
-	if version.id != controlVersionID {
-		panic("control/version.id incorrect")
-	}
-	tag := w.Define(Table{Name: "control/tag"},
+
+	tag := w.csetup(controlTagID, Table{Name: "control/tag"},
 		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "name", Type: String},
 	)
-	if tag.id != controlTagID {
-		panic("control/tag.id incorrect")
-	}
-	table := w.Define(Table{Name: "control/table"},
+
+	table := w.csetup(controlTableID, Table{Name: "control/table"},
 		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "version", Type: Hash, Default: Zero},
 		Col{Name: "name", Type: String},
 		Col{Name: "comment", Type: String, Default: Zero},
 	)
-	if table.id != controlTableID {
-		panic("control/table.id incorrect")
-	}
-	tableTag := w.Define(Table{Name: "control/table/tag"},
+
+	tableTag := w.csetup(controlTableTagID, Table{Name: "control/table/tag"},
 		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "table", Type: Int64},
 		Col{Name: "tag", Type: Int64},
 	)
-	if tableTag.id != controlTableTagID {
-		panic("control/table/tag.id incorrect")
-	}
 
-	fieldtype := w.Define(Table{Name: "control/fieldtype"},
+	fieldtype := w.csetup(controlFieldTypeID, Table{Name: "control/fieldtype"},
 		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "bit_size", Type: Int64},
 		Col{Name: "name", Type: String},
 	)
-	if fieldtype.id != controlFieldTypeID {
-		panic("control/fieldtype.id incorrect")
-	}
 
-	column := w.Define(Table{Name: "control/column"},
+	column := w.csetup(controlColumnID, Table{Name: "control/column"},
 		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "version", Type: Hash, Default: Zero, Tags: Tags{TagHidden}},
 		Col{Name: "table", Type: Int64},
@@ -259,18 +285,25 @@ func (w *Writer) initControl() {
 		Col{Name: "default", Type: Any, Nullable: true},
 		Col{Name: "comment", Type: String, Default: Zero},
 	)
-	if column.id != controlColumnID {
-		panic("control/column.id incorrect")
-	}
 
-	columnTag := w.Define(Table{Name: "control/column/tag"},
+	columnTag := w.csetup(controlColumnTagID, Table{Name: "control/column/tag"},
 		Col{Name: "id", Type: Int64, Key: true},
 		Col{Name: "column", Type: Int64},
 		Col{Name: "tag", Type: Int64},
 	)
-	if columnTag.id != controlColumnTagID {
-		panic("control/column/tag.id incorrect")
-	}
+	_ = table
+	_ = tableTag
+	_ = column
+	_ = columnTag
+
+	w.Insert(tag, TagHidden, "hidden")
+
+	w.Insert(fieldtype, Hash, 256, "hash")
+	w.Insert(fieldtype, Int64, 64, "int64")
+	w.Insert(fieldtype, Bool, 1, "bool")
+	w.Insert(fieldtype, String, 0, "string")
+	w.Insert(fieldtype, Bytes, 0, "bytes")
+	w.Insert(fieldtype, Any, 0, "any")
 
 	w.Flush()
 
@@ -332,15 +365,38 @@ func (w *Writer) Define(t Table, cols ...Col) TableRef {
 	if w.err != nil {
 		return errTable
 	}
-	// TODO(kardianos): encode column schema, store schema in Encoder.
+
 	tid := w.nextRowID(controlTableID)
 	names := make([]string, len(cols))
 	lookup := make(map[string]bool, len(cols))
+
+	tref := w.control[controlTableID]
+	ttagref := w.control[controlTableTagID]
+	cref := w.control[controlColumnID]
+	ctagref := w.control[controlColumnTagID]
+	w.Insert(tref, tid, 0, t.Name, t.Comment)
+
+	for _, tag := range t.Tags {
+		// TODO(kardianos): Verify tag is valid.
+		ttagid := w.nextRowID(controlTableTagID)
+		w.Insert(ttagref, ttagid, tid, tag)
+	}
 	for i, c := range cols {
 		names[i] = c.Name
 		lookup[c.Name] = true
+
+		rid := w.nextRowID(controlColumnID)
+		fixed_bit_size := int64(0) // TODO(kardianos): Calc hash and fixed_bit_size.
+		w.Insert(cref, rid, 0, tid, c.Type, c.Link, c.Key, c.Nullable, c.MaxRunes, fixed_bit_size, c.Name, c.Default, c.Comment)
+
+		for _, tag := range c.Tags {
+			// TODO(kardianos): Verify tag is valid.
+			rtagid := w.nextRowID(controlColumnTagID)
+			w.Insert(ctagref, rtagid, rid, tag)
+		}
 	}
 	w.table[tid] = cols
+
 	return TableRef{
 		id:  tid,
 		all: lookup,
@@ -352,50 +408,88 @@ func (w *Writer) Flush() {
 	if w.err != nil {
 		return
 	}
+	if len(w.rowBuffer) == 0 {
+		return
+	}
 
-	// TODO(kardianos): Don't add data into column, table/tag, or column/tag directlly. Add from previous table definitions.
-	// Gather all un-written schema changes and write them first.
-	encodeTID := make([]int64, 0)
-	for _, tid := range w.tableIDList() {
-		if !w.schemaWritten[tid] {
-			continue
+	if w.chunksWritten == 0 {
+		w.w.Write(fileHeader)
+	}
+
+	type offset struct {
+		Type   byte
+		Offset int64
+	}
+
+	cb := w.chunkBuffer
+
+	for _, tid := range w.rowBufferTID() {
+		rows := w.rowBuffer[tid]
+		delete(w.rowBuffer, tid)
+
+		sizeOfRowOffset := 8
+		sizeOfRowType := 1
+
+		sizeOfTableID := 8
+		sizeOfRowCount := 8
+		sizeOfPerRowHeader := sizeOfRowType + sizeOfRowOffset
+
+		// TODO(kardianos): In the future there may be a another loop to split many buffered rows into multiple chunks.
+
+		headerSize := sizeOfTableID + sizeOfRowCount + (len(rows) * sizeOfPerRowHeader)
+		chunkSize := int64(headerSize)
+		oo := make([]offset, len(rows))
+		for ri, r := range rows {
+			if len(r) < 2 {
+				w.err = fmt.Errorf("invalid row length (%d) for tid=%d", len(r), tid)
+				return
+			}
+			oo[ri].Type = r[1]
+			oo[ri].Offset = chunkSize
+			chunkSize += int64(len(r))
 		}
-		encodeTID = append(encodeTID, tid)
-		w.schemaWritten[tid] = true
 
-	}
-	for _, tid := range encodeTID {
-		// TODO(kardianos): write table block.
-	}
-	for _, tid := range encodeTID {
-		cc := w.table[tid]
-		for i, c := range cc {
-			// TODO(kardianos): write column block.
+		cb.Reset()
+		cb.Write(markerChunk)
+		binary.Write(cb, binary.LittleEndian, chunkSize)
+		binary.Write(cb, binary.LittleEndian, tid)
+		binary.Write(cb, binary.LittleEndian, len(rows))
+
+		for _, r := range rows {
+			cb.Write(r)
 		}
+		_, err := cb.WriteTo(w.w)
+		if err != nil {
+			w.err = err
+			return
+		}
+		w.chunksWritten++
 	}
+	cb.Reset()
+}
 
-	// Then write any un-written data changes.
+func (w *Writer) Cancel() error {
+	if w.err != nil {
+		return w.err
+	}
+	_, err := w.w.Write(fileCancel)
+	if err != nil {
+		w.err = err
+	}
+	w.err = io.EOF
+	return nil
+}
 
-	/*
-		w.Insert(table, controlVersionID, 0, "control/version", "")
-		w.Insert(table, controlTableID, 0, "control/table", "")
-		w.Insert(table, controlFieldTypeID, 0, "control/fieldtype", "")
-		w.Insert(table, controlTagID, 0, "control/tag", "")
-		w.Insert(table, controlColumnID, 0, "control/column", "")
-		w.Insert(table, controlColumnTagID, 0, "control/column/Tag", "")
-
-		w.Insert(fieldtype, Hash, 256, "hash")
-		w.Insert(fieldtype, Int64, 64, "int64")
-		w.Insert(fieldtype, Bool, 1, "bool")
-		w.Insert(fieldtype, String, 0, "string")
-		w.Insert(fieldtype, Bytes, 0, "bytes")
-		w.Insert(fieldtype, Any, 0, "any")
-
-		w.Insert(tag, TagHidden, "hidden")
-
-		// c2 := column.Use("table", "fieldtype", "key", "nullable", "name")
-		// w.Insert(c2, controlVersionID, Hash, false, false, "version")
-	*/
+func (w *Writer) Close() error {
+	if w.err != nil {
+		return w.err
+	}
+	_, err := w.w.Write(fileEOF)
+	if err != nil {
+		w.err = err
+	}
+	w.err = io.EOF
+	return nil
 }
 
 func (w *Writer) nextRowID(tid int64) int64 {
@@ -417,7 +511,11 @@ func (w *Writer) Insert(t TableRef, values ...interface{}) RowRef {
 		w.err = fmt.Errorf("st: invalid table names: %q", t.invalid)
 		return errRow
 	}
+
+	// TODO(kardianos): Encode values row to w.rowBuffer.
+
 	return RowRef{
-		table: w.nextRowID(t.id),
+		table: t.id,
+		id:    -1, // TODO(kardianos): Determine the correct ID, ensure it is greater or equal to the current row table ID.
 	}
 }

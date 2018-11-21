@@ -11,6 +11,12 @@ import (
 var ErrStreamCancel = errors.New("ts: stream cancel")
 
 const (
+	asciiFS = 28
+	asciiGS = 29
+	asciiRS = 30
+	asciiUS = 31
+)
+const (
 	controlVersionID   = 1
 	controlTagID       = 2
 	controlTableID     = 3
