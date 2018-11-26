@@ -29,6 +29,7 @@ type Writer struct {
 	table   map[int64]*tableInfo
 	rowID   map[int64]int64
 	control map[int64]TableRef
+	field   map[Type]FieldCoder
 
 	// rowBuffer is written to by the Insert call, then written to disk
 	// and emptied on Flush.
@@ -54,6 +55,7 @@ func NewWriter(w io.Writer) *Writer {
 		rowID:       make(map[int64]int64, 10),
 		table:       make(map[int64]*tableInfo, 10),
 		control:     make(map[int64]TableRef, 10),
+		field:       make(map[Type]FieldCoder, 10),
 		rowBuffer:   make(map[int64][][]byte, 10),
 	}
 	e.initControl()
@@ -160,16 +162,12 @@ func (w *Writer) initControl() {
 
 	w.Insert(tag, TagHidden, "hidden")
 
-	// TODO(kardianos): Register encoders to types.
 	w.addFieldType(Hash, "hash", coderHash{})
 	w.addFieldType(Int64, "int64", coderInt64{})
-
-	// w.Insert(fieldtype, Hash, 256, "hash")
-	// w.Insert(fieldtype, Int64, 64, "int64")
-	// w.Insert(fieldtype, Bool, 1, "bool")
-	// w.Insert(fieldtype, String, 0, "string")
-	// w.Insert(fieldtype, Bytes, 0, "bytes")
-	// w.Insert(fieldtype, Any, 0, "any")
+	w.addFieldType(Bool, "bool", coderBool{})
+	w.addFieldType(String, "string", coderString{})
+	w.addFieldType(Bytes, "bytes", coderBytes{})
+	w.addFieldType(Any, "any", coderAny{})
 
 	w.Flush()
 
@@ -178,6 +176,7 @@ func (w *Writer) initControl() {
 }
 
 func (w *Writer) addFieldType(ftid Type, name string, fc FieldCoder) {
+	w.field[ftid] = fc
 	w.Insert(w.control[controlFieldTypeID], int64(ftid), fc.BitSize(), name)
 }
 
@@ -411,6 +410,8 @@ func (w *Writer) Insert(t TableRef, values ...interface{}) RowRef {
 		w.err = fmt.Errorf("ts: expected %d values, got %d values", len(t.col), len(values))
 		return errRow
 	}
+	ti := w.table[t.id]
+
 	// TODO(kardianos): Encode values row to w.rowBuffer.
 	cb := w.chunkBuffer
 	cb.Reset()
@@ -419,6 +420,13 @@ func (w *Writer) Insert(t TableRef, values ...interface{}) RowRef {
 	// Decide which columns have values.
 	// Encode the value bit-mask prefix.
 	// Loop through each column and write it to the buffer.
+	emptyBitmaskLength := len(ti.Columns) / 8
+	if len(ti.Columns)%8 != 0 {
+		emptyBitmaskLength++
+	}
+	for i := range ti.Columns {
+		_ = i
+	}
 
 	rowdata := make([]byte, cb.Len())
 	copy(rowdata, cb.Bytes())
